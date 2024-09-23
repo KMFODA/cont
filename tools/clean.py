@@ -15,65 +15,70 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import io
-import os
-import sys
+import argparse
 import copy
+import io
 import json
+import os
+import random
+import sys
+import tempfile
 import time
 import types
+from types import SimpleNamespace
+
 import boto3
 import torch
-import typer
-import wandb
-import random
-import argparse
-import tempfile
-from tqdm import tqdm
 import torch.optim as optim
+import typer
 from dotenv import dotenv_values
-from types import SimpleNamespace
-from transformers import AutoTokenizer
-from transformers import GPT2Config, GPT2LMHeadModel
+from tqdm import tqdm
+from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
+
+import wandb
 
 env_config = {**dotenv_values(".env"), **os.environ}
-AWS_ACCESS_KEY_ID = env_config.get('AWS_ACCESS_KEY_ID')
-AWS_SECRET_ACCESS_KEY = env_config.get('AWS_SECRET_ACCESS_KEY')
+AWS_ACCESS_KEY_ID = env_config.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = env_config.get("AWS_SECRET_ACCESS_KEY")
 CLIENT: boto3.client = boto3.client(
-    's3',
-    region_name='us-east-1',
-    aws_access_key_id = AWS_ACCESS_KEY_ID,
-    aws_secret_access_key = AWS_SECRET_ACCESS_KEY
+    "s3",
+    region_name="us-east-1",
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
 )
 
+
 def main(
-    bucket: str = 'decis',
+    bucket: str = "decis",
 ):
     # Create your S3 connection.
     client: boto3.client = boto3.client(
-        's3',
-        region_name = 'us-east-1',
-        aws_access_key_id = AWS_ACCESS_KEY_ID,
-        aws_secret_access_key = AWS_SECRET_ACCESS_KEY
+        "s3",
+        region_name="us-east-1",
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
     continuation_token = None
     while True:
         if continuation_token:
-            response = client.list_objects_v2(Bucket=bucket, ContinuationToken=continuation_token)
+            response = client.list_objects_v2(
+                Bucket=bucket, ContinuationToken=continuation_token
+            )
         else:
             response = client.list_objects_v2(Bucket=bucket)
-        
-        file_names = [content['Key'] for content in response.get('Contents', [])]
-        
+
+        file_names = [content["Key"] for content in response.get("Contents", [])]
+
         # Delete all the filenames
         for file_name in file_names:
             client.delete_object(Bucket=bucket, Key=file_name)
             print(f"Deleted {file_name}")
-        
+
         # Check if there are more files to delete
-        continuation_token = response.get('NextContinuationToken')
+        continuation_token = response.get("NextContinuationToken")
         if not continuation_token:
             break
+
 
 # Main function.
 if __name__ == "__main__":

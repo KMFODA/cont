@@ -9,65 +9,71 @@
 # The above copyright notice and this permission notice shall be included in all copies or substantial portions of
 # the Software.
 
+import argparse
+import copy
 # THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
 # THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 # THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 import io
-import os
-import sys
-import copy
 import json
+import os
+import random
+import sys
+import tempfile
 import time
 import types
+from types import SimpleNamespace
+
 import boto3
 import torch
-import typer
-import wandb
-import random
-import argparse
-import tempfile
-from tqdm import tqdm
 import torch.optim as optim
+import typer
 from dotenv import dotenv_values
-from types import SimpleNamespace
-from transformers import AutoTokenizer
-from transformers import GPT2Config, GPT2LMHeadModel
 from rich.console import Console
 from rich.table import Table
+from tqdm import tqdm
+from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
+
+import wandb
 
 env_config = {**dotenv_values(".env"), **os.environ}
 
+
 def human_readable_size(size, decimal_places=2):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024.0:
             return f"{size:.{decimal_places}f} {unit}"
         size /= 1024.0
 
+
 def main(
-    bucket: str = 'decis',
-    aws_access_key_id: str = env_config.get('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key: str = env_config.get('AWS_SECRET_ACCESS_KEY'),
+    bucket: str = "decis",
+    aws_access_key_id: str = env_config.get("AWS_ACCESS_KEY_ID"),
+    aws_secret_access_key: str = env_config.get("AWS_SECRET_ACCESS_KEY"),
 ):
     # Create the hparams item.
     hparams = SimpleNamespace(
-        bucket = bucket,
-        aws_access_key_id = aws_access_key_id,
-        aws_secret_access_key = aws_secret_access_key,
+        bucket=bucket,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
     )
     # Create your S3 connection.
     client: boto3.client = boto3.client(
-        's3',
-        region_name = 'us-east-1',
-        aws_access_key_id = hparams.aws_access_key_id,
-        aws_secret_access_key = hparams.aws_secret_access_key
+        "s3",
+        region_name="us-east-1",
+        aws_access_key_id=hparams.aws_access_key_id,
+        aws_secret_access_key=hparams.aws_secret_access_key,
     )
     response = client.list_objects_v2(Bucket=hparams.bucket)
-    if 'Contents' in response:
+    if "Contents" in response:
         # Extract both file names and sizes
-        file_info = [(content['Key'], content['Size'], content['LastModified']) for content in response['Contents']]
-        
+        file_info = [
+            (content["Key"], content["Size"], content["LastModified"])
+            for content in response["Contents"]
+        ]
+
         # Create a table using rich
         table = Table(title="S3 Bucket Files")
         table.add_column("File Name", justify="left", style="cyan", no_wrap=True)
@@ -79,33 +85,34 @@ def main(
 
         for file_name, file_size, last_modified in file_info:
             # Extract hotkey, ss5d address, and block from the file name
-            parts = file_name.split('-')
+            parts = file_name.split("-")
             if len(parts) >= 3:
                 hotkey = parts[1]
                 ss5d_address = parts[2]
-                block = parts[-1].split('_')[0]
+                block = parts[-1].split("_")[0]
             else:
                 hotkey = ss5d_address = block = "N/A"
-            
+
             table.add_row(
                 file_name,
                 human_readable_size(file_size),
                 last_modified.strftime("%Y-%m-%d %H:%M:%S"),
                 hotkey,
                 ss5d_address,
-                block
+                block,
             )
 
         console = Console()
         console.print(table)
 
-        print('\nStats')
-        print('Total Files:', len(file_info))
+        print("\nStats")
+        print("Total Files:", len(file_info))
         total_size = sum(file_size for _, file_size, _ in file_info)
-        print(f'Total Size: {human_readable_size(total_size)}')
+        print(f"Total Size: {human_readable_size(total_size)}")
 
     else:
-        print('No files found in the bucket.')
+        print("No files found in the bucket.")
+
 
 # Main function.
 if __name__ == "__main__":
