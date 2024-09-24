@@ -17,6 +17,8 @@
 
 import argparse
 import concurrent.futures
+# fmt: off
+
 import io
 import os
 import tempfile
@@ -41,6 +43,13 @@ from hparams import load_hparams
 
 # Enable cuDNN benchmark for optimized performance
 torch.backends.cudnn.benchmark = True
+
+# The flag below controls whether to allow TF32 on matmul. This flag defaults to False
+# in PyTorch 1.12 and later.
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
+torch.backends.cudnn.allow_tf32 = True
 
 # Instantiate the AWS S3 client.
 env_config = {**dotenv_values(".env"), **os.environ}  # Load environment variables.
@@ -129,27 +138,19 @@ def main(config):
                     master_state_dict = torch.load(
                         unique_temp_file, map_location="cpu", weights_only=True
                     )
-                    model = LlamaForCausalLM(config=hparams.model_config)
+                    model = LlamaForCausalLM(config=hparams.model_config, attn_implementation="flash_attention_2" )
                     model.load_state_dict(master_state_dict)
                     model.to(config.device)
                     model.train()
                     optimizer = optim.AdamW(
                         model.parameters(),
-                        lr=config.learning_rate,  # Peak learning rate
-                        betas=(
-                            config.optimizer_beta1,
-                            config.optimizer_beta2,
-                        ),  # B1 and B2
-                        weight_decay=config.optimizer_weight_decay,  # Weight decay
+                        lr = config.learning_rate,  # Peak learning rate
+                        betas = ( config.optimizer_beta1, config.optimizer_beta2 ), # B1 and B2
+                        weight_decay = config.optimizer_weight_decay,  # Weight decay
+                        foreach = True,  # more memory usage, but faster
                     )
-                    scaler = torch.cuda.amp.GradScaler()
-                    scheduler = CosineAnnealingLR(
-                        optimizer,
-                        T_max=hparams.epoch_length,
-                        eta_min=4e-5,
-                        last_epoch=-1,
-                    )
-                    last_master_sync = subtensor.block
+                    scheduler = CosineAnnealingLR( optimizer, T_max = hparams.epoch_length, eta_min=4e-5, last_epoch=-1 )
+                    last_master_sync = subtensor.block 
                     last_mask_sync = last_master_sync
                 except Exception as e:
                     print(f"No master:{e} Waiting ...")
@@ -334,22 +335,17 @@ def main(config):
             # Train my model on the current page.
             torch.cuda.empty_cache()  # Empty cache going into the training step.
             start_time = time.time()  # Start timing
-            optimizer.zero_grad()
             total_loss = 0.0
             total_steps = config.desired_batch_size // config.actual_batch_size
             progress_bar = tqdm(total=total_steps, desc="Training:")
             for idx, batch in enumerate(dataset):
                 input_ids = torch.tensor(batch, dtype=torch.long).to(model.device)
                 labels = input_ids.clone()
-                labels = torch.where(
-                    labels == hparams.tokenizer.pad_token_id, -100, labels
-                )
-                with torch.amp.autocast(
-                    device_type=model.device.type, dtype=torch.float16
-                ):  # Enable autocasting for mixed precision
-                    outputs = model(input_ids=input_ids, labels=labels)
+                labels = torch.where(labels == hparams.tokenizer.pad_token_id, -100, labels)
+                with torch.amp.autocast( device_type = model.device.type, dtype = torch.bfloat16 ):  # Enable autocasting for mixed precision
+                    outputs = model(input_ids = input_ids, labels=labels)
                 total_loss += outputs.loss.item()
-                scaler.scale(outputs.loss).backward()
+                outputs.loss.backward()
                 progress_bar.update(1)  # Update the progress bar
                 if idx >= total_steps - 1:
                     break
@@ -357,9 +353,12 @@ def main(config):
 
             # Try step with error handling.
             try:
-                scaler.step(optimizer)  # Unscale the gradients and step the optimizer
-                scaler.update()  # Update the scaler for next iteration
+                # grad norm clipping
+                if config.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+                optimizer.step()
                 scheduler.step()  # Update the learning rate.
+                optimizer.zero_grad()
             except AssertionError as e:
                 print(f"An error occurred during the optimizer step: {e}")
 
