@@ -31,11 +31,10 @@ import boto3
 import torch
 import torch.optim as optim
 import typer
+import wandb
 from dotenv import dotenv_values
 from tqdm import tqdm
 from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
-
-import wandb
 
 env_config = {**dotenv_values(".env"), **os.environ}
 AWS_ACCESS_KEY_ID = env_config.get("AWS_ACCESS_KEY_ID")

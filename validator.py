@@ -30,13 +30,13 @@ import bittensor as bt
 import boto3
 import numpy as np
 import torch
-from dataset import SubsetFineWebEdu2Loader
+import wandb
 from dotenv import dotenv_values
-from hparams import load_hparams
 from tqdm import tqdm
 from transformers import LlamaForCausalLM
 
-import wandb
+from dataset import SubsetFineWebEdu2Loader
+from hparams import load_hparams
 
 # Instantiate the AWS S3 client.
 env_config = {**dotenv_values(".env"), **os.environ}  # Load environment variables.

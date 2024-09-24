@@ -30,13 +30,12 @@ import boto3
 import torch
 import torch.optim as optim
 import typer
+import wandb
 from dotenv import dotenv_values
 from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
 from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
-
-import wandb
 
 env_config = {**dotenv_values(".env"), **os.environ}
 
