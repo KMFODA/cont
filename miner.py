@@ -78,7 +78,7 @@ def main(config):
 
     # Initialize Weights and Biases (wandb) for experiment tracking if enabled.
     if config.use_wandb:
-        run = wandb.init(project='cont', resume='allow', name=f'M{my_uid}', config=config)
+        run = wandb.init(project='cont', resume='allow', name=f'M{config.name}', config=config)
         
     # Init training state.
     hparams = load_hparams()
@@ -102,7 +102,8 @@ def main(config):
             start_time = time.time() 
             if model == None or subtensor.block - last_master_sync > hparams.epoch_length:
                 try:
-                    master_uid = int(metagraph.S.argmax())
+                    # master_uid = int(metagraph.S.argmax())
+                    master_uid = 26
                     master_bucket = subtensor.get_commitment( config.netuid, master_uid )
                     master_hotkey = metagraph.hotkeys[ master_uid ]
                     master_filename = f'master-{master_hotkey}.pt'
@@ -139,7 +140,8 @@ def main(config):
             # Get buckets per uid if needs update.
             if 'buckets' not in locals() or len(buckets) != len(metagraph.uids):
                 buckets = []
-                for uid in metagraph.uids:
+                # for uid in metagraph.uids:
+                for uid in [27, 36, 37]:
                     try:
                         buckets.append( subtensor.get_commitment(config.netuid, uid) )
                     except:
@@ -153,7 +155,7 @@ def main(config):
                 # Pull the filenames + buckets for all miners.
                 print (f'Getting filenames for blk: {blk} ...')
                 start_time = time.time()
-                mask_filenames = [ f"mask-{str(metagraph.hotkeys[uid])}-{blk}.pt" for uid in  metagraph.uids ]
+                mask_filenames = [ f"mask-{str(metagraph.hotkeys[uid])}-{blk}.pt" for uid in  [27, 36, 37] ]
                 print(f'Get filenames completed in {time.time() - start_time} seconds')
 
                 # Download the masks from all valid files
@@ -288,7 +290,8 @@ def main(config):
                 with torch.amp.autocast( device_type = model.device.type, dtype = torch.float16 ):  # Enable autocasting for mixed precision
                     outputs = model(input_ids = input_ids, labels=labels)
                 total_loss += outputs.loss.item()
-                scaler.scale( outputs.loss ).backward()
+                loss = outputs.loss / total_steps
+                scaler.scale( loss ).backward()
                 progress_bar.update(1)  # Update the progress bar
                 if idx >= total_steps - 1:
                     break
@@ -331,7 +334,7 @@ def main(config):
             torch.manual_seed(next_upload_block)  # Seed torch's random generator with the upload block.
             for name, param in model.named_parameters():
                 param = param.to(config.device)
-                next_mask = (torch.rand(param.shape, device=config.device) < (1 / hparams.compression)).float()
+                next_mask = (torch.rand(param.shape, device=config.device) < (1 / config.compression)).float()
                 upload_mask[name] = next_mask.to('cpu')
             print(f'Creating upload block mask completed in {time.time() - start_time} seconds')
             
@@ -393,13 +396,14 @@ if __name__ == "__main__":
     parser.add_argument('--netuid', type=int, default=212, help='Bittensor network UID.')
     parser.add_argument('--bucket', type=str, default='decis', help='S3 bucket name')
     parser.add_argument('--desired_batch_size', type=int, default=512, help='Training batch size per step')
-    parser.add_argument('--actual_batch_size', type=int, default=9, help='Training batch size per accumulation.')
+    parser.add_argument('--actual_batch_size', type=int, default=8, help='Training batch size per accumulation.')
     parser.add_argument('--learning_rate', type=float, default=4e-4, help='Learning rate for the optimizer')
     parser.add_argument('--optimizer_beta1', type=float, default=0.9, help='Beta1 for the optimizer')
     parser.add_argument('--optimizer_beta2', type=float, default=0.95, help='Beta2 for the optimizer')
     parser.add_argument('--optimizer_weight_decay', type=float, default=0.1, help='Weight decay for the optimizer')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')    
+    parser.add_argument('--compression', type=int, default=300)    
     bt.wallet.add_args(parser)
     bt.subtensor.add_args(parser)    
     config = bt.config(parser)    

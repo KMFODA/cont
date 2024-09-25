@@ -75,7 +75,7 @@ def main(config):
 
     # Initialize Weights and Biases (wandb) for experiment tracking if enabled.
     if config.use_wandb:
-        run = wandb.init(project='cont', resume='allow', name=f'V{my_uid}', config=config)
+        run = wandb.init(project='cont', resume='allow', name=f'V{config.name}', config=config)
         
     # Init the master model
     hparams = load_hparams()
@@ -130,10 +130,10 @@ def main(config):
                 start_time = time.time()
                 if 'buckets' not in locals() or metagraph.n != len( buckets ):
                     buckets = []
-                    for uid in metagraph.uids:
+                    for uid in [27, 36, 37]:
                         buckets.append(subtensor.get_commitment(config.netuid, uid))
                 mask_filenames = []
-                for uid in metagraph.uids:
+                for uid in [27, 36, 37]:
                     mask_filenames.append((uid, f"mask-{str(metagraph.hotkeys[uid])}-{blk}.pt"))
                 print(f'Get filenames completed in {time.time() - start_time} seconds.')
             
@@ -356,7 +356,7 @@ def main(config):
             subtensor.set_weights(
                 wallet=wallet,
                 netuid=config.netuid,
-                uids=metagraph.uids.tolist(),
+                uids=[27, 36, 37],
                 weights=weights.tolist(),
                 wait_for_inclusion=False,
                 wait_for_finalization=False,

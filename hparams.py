@@ -25,17 +25,17 @@ def load_hparams() -> SimpleNamespace:
         # Delta compression rate.
         'compression': 300,
         # Global sequence length
-        'sequence_length': 2048,
+        'sequence_length': 1024,
         # AutoTokenizer name.
         'tokenizer_name': 'gpt2',
         # Model arch.
-        'num_hidden_layers': 16,         # Layers
-        'hidden_size': 2048,             # Hidden Size
-        'intermediate_size': 8192,       # Intermediate Size
-        'num_attention_heads': 8,        # Attention Heads
-        'num_key_value_heads': 8,        # Key/Value Heads
+        'num_hidden_layers': 12,         # Layers
+        'hidden_size': 768,             # Hidden Size
+        'intermediate_size': 3072,       # Intermediate Size
+        'num_attention_heads': 12,        # Attention Heads
+        'num_key_value_heads': 12,        # Key/Value Heads
         'activation_function': "swiGLU", # Activation Function
-        'max_position_embeddings': 2048, # Positional Embeddings (RoPE)
+        'max_position_embeddings': 1024, # Positional Embeddings (RoPE)
     }
     # Convert the dictionary to a SimpleNamespace
     hparams_ns = SimpleNamespace(**hparams)
