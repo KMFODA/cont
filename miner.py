@@ -70,6 +70,11 @@ def initialize_wandb(config, my_uid):
         )
     return None
 
+def block_to_mask_id(block: int, hparams) -> int:
+    """Function which maps from block to mask_id such that multiple blocks share the same mask id.
+    This is used to ensure that the model is not updated too frequently and that the mask is shared.
+    for multiple updates which fall across multiple blocks."""
+    return int(block / hparams.blocks_per_mask)
 
 def sync_chain_state(config, subtensor, my_uid, wallet):
     """Sync the current chain state and commit bucket if necessary."""
@@ -119,7 +124,7 @@ def download_masks(config, subtensor, metagraph, model, last_mask_sync, hparams)
     """Download and apply masks from other miners."""
     block = subtensor.block
     all_sync_blocks = list(range(last_mask_sync - 2, block + 1))
-    last_mask_sync = block
+    last_mask_sync = (block_to_mask_id(block, hparams) + 1) * hparams.blocks_per_mask
 
     # Get buckets per uid if needs update.
     if "buckets" not in locals() or len(buckets) != len(metagraph.uids):
@@ -130,18 +135,38 @@ def download_masks(config, subtensor, metagraph, model, last_mask_sync, hparams)
             except:
                 buckets.append(None)
 
+    # For each bucket, get all files that need to be synced.
+    print(f'Getting masks names for blocks: {all_sync_blocks} and buckets: {set(buckets)}')
+    num_valid_masks = 0
+    mask_filenames_per_mask_id = {block_to_mask_id(blk, hparams): [] for blk in all_sync_blocks}
+    for bucket in list(set(buckets)):
+        if bucket is None:
+            continue
+        paginator = CLIENT.get_paginator('list_objects_v2')
+        page_iterator = paginator.paginate(Bucket=bucket, Prefix='mask-')
+        for page in page_iterator:
+            if 'Contents' not in page:
+                continue  # Filter not found
+            for obj in page['Contents']:
+                hotkey, blk = obj['Key'].split('-')[1], obj['Key'].split('-')[2].split('.')[0]
+                if int(blk) in all_sync_blocks:
+                    mask_filenames_per_mask_id[block_to_mask_id(int(blk), hparams)].append({'bucket': bucket, 'hotkey': hotkey, 'filename': obj['Key']})
+                    num_valid_masks += 1
+
     # Get the mask for all sync blocks.
-    print(f"Downloading masks for blocks: {all_sync_blocks}")
-    for blk in all_sync_blocks:
-        mask_filenames = [
-            f"mask-{str(metagraph.hotkeys[uid])}-{blk}.pt" for uid in metagraph.uids
-        ]
-        temp_files = download_mask_files(buckets, mask_filenames)
+    print(f"Downloading {num_valid_masks} masks for blocks: {all_sync_blocks}")
+    for mask_id in mask_filenames_per_mask_id.keys():
+        # Get the number of masks for this step.
+        num_masks_for_mask_id = len(mask_filenames_per_mask_id[mask_id])
+        if num_masks_for_mask_id == 0:
+            continue
+
+        temp_files = download_mask_files(mask_filenames_per_mask_id[mask_id])
 
         if not temp_files:
             continue
 
-        mask_indices = create_sync_mask(model, blk, config.device, hparams.compression)
+        mask_indices = create_sync_mask(model, mask_id, config.device, hparams.compression)
         masks_dicts_values, mask_count = load_and_average_masks(
             temp_files, mask_indices, model, blk
         )
@@ -156,25 +181,23 @@ def download_masks(config, subtensor, metagraph, model, last_mask_sync, hparams)
     return last_mask_sync
 
 
-def download_file(bucket, filename):
+def download_file(mask_info):
     try:
-        if bucket is None:
-            return None
         unique_temp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pt")
-        CLIENT.download_file(bucket, filename, unique_temp_file)
+        CLIENT.download_file(mask_info['bucket'], mask_info['filename'], unique_temp_file)
         return unique_temp_file
     except:
         return None
 
 
-def download_mask_files(buckets, mask_filenames):
+def download_mask_files(mask_filenames):
     """Download mask files from S3 buckets."""
     temp_files = []
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [
-            executor.submit(download_file, bucket, filename)
-            for bucket, filename in zip(buckets, mask_filenames)
+            executor.submit(download_file, mask_info)
+            for mask_info in mask_filenames
         ]
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
@@ -184,10 +207,11 @@ def download_mask_files(buckets, mask_filenames):
     return temp_files
 
 
-def create_sync_mask(model, block, device, compression):
-    """Create a synchronization mask for the given block."""
+def create_sync_mask(model, mask_id, device, compression):
+    """Create a synchronization mask for the given mask_id."""
+    print(f'Creating mask for mask_id: {mask_id} ...')
     mask_indices = {}
-    torch.manual_seed(block)
+    torch.manual_seed(mask_id)
     for name, param in model.named_parameters():
         param = param.to(device)
         next_mask = (torch.rand(param.shape, device=device) < (1 / compression)).float()
@@ -196,12 +220,13 @@ def create_sync_mask(model, block, device, compression):
     return mask_indices
 
 
-def load_and_average_masks(temp_files, mask_indices, model, blk):
+def load_and_average_masks(temp_files, mask_indices, model, mask_id):
     """Load and average masks from temporary files."""
+    print(f'Loading state dicts for mask_id: {mask_id} ...')
     masks_dicts_values = {}
     mask_count = 0
     for file in temp_files:
-        mask = torch.load(file, map_location="cpu", weights_only=True)
+        mask = torch.load(file, map_location="cpu")
         mask_count += 1
         for name in mask.keys():
             mask_values = mask[name]["values"]
@@ -217,7 +242,7 @@ def load_and_average_masks(temp_files, mask_indices, model, blk):
                 masks_dicts_values[name] += decompressed.view(param_shape)
 
     # Average the masks before applying.
-    print(f"Averaging {mask_count} masks for block: {blk} ...")
+    print(f"Averaging {mask_count} masks for block: {mask_id} ...")
     start_time = time.time()
     for key in masks_dicts_values.keys():
         masks_dicts_values[key] /= mask_count
@@ -254,13 +279,13 @@ def apply_masks_to_model(model, masks_dicts_values, mask_indices, mask_count, bl
     )
 
 
-def create_upload_mask(model, block, device, compression):
+def create_upload_mask(model, block, device, hparams):
     """Create an upload mask for the current model state."""
     upload_mask = {}
-    torch.manual_seed(block)
+    torch.manual_seed(block_to_mask_id(block, hparams) )
     for name, param in model.named_parameters():
         param = param.to(device)
-        next_mask = (torch.rand(param.shape, device=device) < (1 / compression)).float()
+        next_mask = (torch.rand(param.shape, device=device) < (1 / hparams.compression)).float()
         upload_mask[name] = next_mask.to("cpu")
     return upload_mask
 
@@ -300,7 +325,7 @@ def upload_model_to_s3(model_state_dict, bucket, filename):
 def train_model(config, model, optimizer, scheduler, dataset, hparams):
     """Train the model on the current page."""
     total_loss = 0.0
-    total_steps = config.desired_batch_size // config.actual_batch_size
+    total_steps = hparams.desired_batch_size // config.actual_batch_size
     progress_bar = tqdm(total=total_steps, desc="Training:")
 
     for idx, batch in enumerate(dataset):
@@ -338,7 +363,7 @@ def create_and_upload_mask(config, model, wallet, subtensor, hparams):
     """Create and upload a mask for the current model state."""
     next_upload_block = subtensor.block
     upload_mask = create_upload_mask(
-        model, next_upload_block, config.device, hparams.compression
+        model, next_upload_block, config.device, hparams
     )
     model_state_dict = apply_mask_to_model(model, upload_mask)
 
@@ -380,7 +405,7 @@ def main(config):
                 config, subtensor, metagraph, model, last_mask_sync, hparams
             )
 
-            n_pages = max(1, int(config.desired_batch_size * 0.01))
+            n_pages = max(1, int(hparams.desired_batch_size * 0.01))
             pages = SubsetFineWebEdu2Loader.next_pages(
                 offset=subtensor.block + n_pages, n_pages=n_pages, seed=my_uid
             )
@@ -434,12 +459,6 @@ if __name__ == "__main__":
         "--netuid", type=int, default=212, help="Bittensor network UID."
     )
     parser.add_argument("--bucket", type=str, default="decis", help="S3 bucket name")
-    parser.add_argument(
-        "--desired_batch_size",
-        type=int,
-        default=512,
-        help="Training batch size per step",
-    )
     parser.add_argument(
         "--actual_batch_size",
         type=int,
