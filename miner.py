@@ -15,6 +15,8 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
+# fmt: off
+
 import io
 import os
 import uuid
@@ -32,6 +34,7 @@ import concurrent.futures
 import torch.optim as optim
 from typing import List, Tuple
 from dotenv import dotenv_values
+from types import SimpleNamespace
 from transformers import LlamaForCausalLM 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -40,6 +43,13 @@ from dataset import SubsetFineWebEdu2Loader
 
 # Enable cuDNN benchmark for optimized performance
 torch.backends.cudnn.benchmark = True
+
+# The flag below controls whether to allow TF32 on matmul. This flag defaults to False
+# in PyTorch 1.12 and later.
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
+torch.backends.cudnn.allow_tf32 = True
 
 # Instantiate the AWS S3 client.
 env_config = {**dotenv_values(".env"), **os.environ}  # Load environment variables.
@@ -81,26 +91,40 @@ def main(config):
         run = wandb.init(project='cont', resume='allow', name=f'M{config.name}', config=config)
         
     # Init training state.
+    print('\n', '-' * 40, 'Hparams', '-' * 40)
     hparams = load_hparams()
+    print ( hparams ) 
     model = None
     upload_history = []  
     last_mask_sync = 0 
     last_master_sync = 0
+    n_steps = 0
     while True:
-        try:    
+        try:   
+            print('\n', '-' * 40, f'Step: {n_steps}', '-' * 40) 
+            # Start timing for the entire step
+            global_step_start_time = time.time()
+            n_steps += 1
             
-            # Sync the current chain state and hparams.
-            print ('Loading chain state ...')
+            # Load hparams.
+            print ('\nLoading hparams ...')
             start_time = time.time()
-            hparams = load_hparams()
+            new_hparams = load_hparams()
+            hparams_changed = any(getattr(new_hparams, key) != getattr(hparams, key) for key in set(vars(new_hparams)) | set(vars(hparams)))
+            hparams = new_hparams
+            print(f'\tLoading hparams completed in {time.time() - start_time} seconds') 
+
+            # Sync the current chain state and hparams.
+            print ('\nLoading chain state ...')
+            start_time = time.time()
             subtensor = bt.subtensor(config=config)
             metagraph = subtensor.metagraph(netuid=config.netuid)
-            print(f'Loading chain state completed in {time.time() - start_time} seconds') 
+            print(f'\tLoading chain state completed in {time.time() - start_time} seconds') 
             
             # Sync the full model state every hparams.epoch_length
-            print(f'Checking epoch sync ...') 
-            start_time = time.time() 
             if model == None or subtensor.block - last_master_sync > hparams.epoch_length:
+                print(f'\nLoading master state ...') 
+                start_time = time.time() 
                 try:
                     # master_uid = int(metagraph.S.argmax())
                     master_uid = 26
@@ -110,161 +134,226 @@ def main(config):
                     unique_temp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pt")
                     CLIENT.download_file( master_bucket, master_filename, unique_temp_file )
                     master_state_dict = torch.load( unique_temp_file, map_location='cpu', weights_only = True )
-                    model = LlamaForCausalLM( config = hparams.model_config ) 
+                    model = LlamaForCausalLM( config = hparams.model_config )
                     model.load_state_dict( master_state_dict )
                     model.to(config.device)
                     model.train()
-                    optimizer = optim.AdamW(
-                        model.parameters(),
-                        lr = config.learning_rate,  # Peak learning rate
-                        betas = ( config.optimizer_beta1, config.optimizer_beta2 ), # B1 and B2
-                        weight_decay = config.optimizer_weight_decay  # Weight decay
-                    )
-                    scaler = torch.cuda.amp.GradScaler()
-                    scheduler = CosineAnnealingLR( optimizer, T_max = hparams.epoch_length, eta_min=4e-5, last_epoch=-1 )
                     last_master_sync = subtensor.block 
                     last_mask_sync = last_master_sync
                 except Exception as e:
                     print (f'No master:{e} Waiting ...')
                     time.sleep(12)
                     continue
-            print(f'Checking epoch sync: completed in {time.time() - start_time} seconds') 
+                print(f'\tCLoading master state completed in {time.time() - start_time} seconds') 
             
-            print(f'Getting block state ...')
+            if 'optimizer' not in locals() or optimizer == None or hparams_changed:
+                print(f'\nResetting optimizer ...') 
+                start_time = time.time()
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr = hparams.learning_rate,  # Peak learning rate
+                    betas = ( hparams.optimizer_beta1, hparams.optimizer_beta2 ), # B1 and B2
+                    weight_decay = hparams.optimizer_weight_decay,  # Weight decay
+                    foreach = True,  # more memory usage, but faster
+                )
+                scheduler = CosineAnnealingLR( optimizer, T_max = hparams.cosine_epoch_length, eta_min=hparams.eta_min, last_epoch=-1 )
+                scaler = torch.cuda.amp.GradScaler()
+                print(f'\tResetting optimizercompleted in {time.time() - start_time} seconds') 
+
+
+            print(f'\nGetting blocks and buckets ...')
             start_time = time.time()  # Start timing
+            # Function which maps from block to mask_wid such that multiple blocks share the same mask window id.
+            # This is used to ensure that the model is not updated too frequently and that the mask is shared.
+            # for multiple updates which fall across multiple blocks.
+            def block_to_mask_window_id(block: int) -> int:
+                return int(block / hparams.mask_window_length)
+            # This fast forwards us to the block which shares no ids with the previous block.
+            # If we don't do this fast forward, then we will be downloading the same masks multiple times.
+            # TODO (const) consider if we should just remember the last mask id and download all masks for that id.
+            # Or if we should just redownload and apply the same masks.
             block = subtensor.block
-            all_sync_blocks = list(range(last_mask_sync - 2, block + 1))
-            last_mask_sync = block
-            print(f'Getting block completed in {time.time() - start_time} seconds')
-            
+            all_sync_blocks = list(range(last_mask_sync - 2, block + 1))            
+            last_mask_sync = (block_to_mask_window_id(block) + 1) * hparams.mask_window_length
             # Get buckets per uid if needs update.
             if 'buckets' not in locals() or len(buckets) != len(metagraph.uids):
                 buckets = []
                 # for uid in metagraph.uids:
                 for uid in [27, 36, 37]:
                     try:
-                        buckets.append( subtensor.get_commitment(config.netuid, uid) )
+                        buckets.append(subtensor.get_commitment(config.netuid, uid))
                     except:
-                        buckets.append( None )
-            
-            # Get the mask for all sync blocks.
-            print(f'Downloading masks for blocks: {all_sync_blocks}') 
+                        buckets.append(None)
+            print(f'\tGetting block completed in {time.time() - start_time} seconds')
+
+            # For each bucket, get all files that need to be synced.
+            print(f'\nGetting masks names for blocks: {all_sync_blocks} and buckets: {set(buckets)}')
+            num_valid_masks = 0
+            start_time = time.time()
+            mask_filenames_per_mask_wid = {block_to_mask_window_id(blk): [] for blk in all_sync_blocks}
+            for bucket in list(set(buckets)):
+                if bucket is None:
+                    continue
+                paginator = CLIENT.get_paginator('list_objects_v2')
+                page_iterator = paginator.paginate(Bucket=bucket, Prefix='mask-')
+                for page in page_iterator:
+                    for obj in page.get('Contents', []):
+                        try:
+                            hotkey, blk = obj['Key'].split('-')[1], obj['Key'].split('-')[2].split('.')[0]
+                            if int(blk) in all_sync_blocks:
+                                mask_wid = block_to_mask_window_id(int(blk))
+                                mask_info = SimpleNamespace(bucket=bucket, hotkey=hotkey, filename=obj['Key'], uid=metagraph.hotkeys.index(hotkey), block=int(blk), mask_wid=mask_wid)
+                                mask_filenames_per_mask_wid[mask_wid].append(mask_info)
+                                num_valid_masks += 1
+                        except:
+                            continue
+            print(f'\tGetting masks names for blocks: {all_sync_blocks} completed in {time.time() - start_time} seconds')
+
+            # Get the mask for mask_wids.
+            print(f'\nDownloading {num_valid_masks} masks for: {all_sync_blocks}')
             full_sync_start_time = time.time()
-            for blk in all_sync_blocks:
-                
-                # Pull the filenames + buckets for all miners.
-                print (f'Getting filenames for blk: {blk} ...')
-                start_time = time.time()
-                mask_filenames = [ f"mask-{str(metagraph.hotkeys[uid])}-{blk}.pt" for uid in  [27, 36, 37] ]
-                print(f'Get filenames completed in {time.time() - start_time} seconds')
+            masks_per_id_per_uid = {}
+            mask_count_per_id = {}
+            compression_per_uid = {}
+
+            for mask_wid in mask_filenames_per_mask_wid.keys():
+                masks_per_id_per_uid[mask_wid] = {}
+                # Get the number of masks for this step.
+                num_masks_for_mask_wid = len(mask_filenames_per_mask_wid[mask_wid])
+                if num_masks_for_mask_wid == 0:
+                    continue
 
                 # Download the masks from all valid files
-                print(f'Downloading mask for blk: {blk} ... ')
+                print(f'\n\tDownloading {num_masks_for_mask_wid} mask for mask_wid: {mask_wid} ... ')
                 start_time = time.time()
                 temp_files = []
                 n_downloaded = 0
-                def download_file( bucket, filename ):
+                def download_file(mask_info):
                     try:
-                        if bucket == None: return None
-                        unique_temp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pt")
-                        CLIENT.download_file(bucket, filename, unique_temp_file)
-                        return unique_temp_file
+                        temp_file = os.path.join(tempfile.gettempdir(), f"{uuid.uuid4()}.pt")
+                        CLIENT.download_file(mask_info.bucket, mask_info.filename, temp_file)
+                        mask_info = SimpleNamespace(**vars(mask_info), temp_file=temp_file)
+                        return mask_info
                     except:
                         return None
+
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    futures = [executor.submit(download_file, bucket, filename) for bucket, filename in zip(buckets, mask_filenames)]
+                    futures = [executor.submit(download_file, mask_info) for mask_info in mask_filenames_per_mask_wid[mask_wid]]
                     for future in concurrent.futures.as_completed(futures):
                         result = future.result()
                         if result:
                             temp_files.append(result)
                             n_downloaded += 1
-                print(f'Downloading {n_downloaded} masks completed in {time.time() - start_time} seconds')
-                
+                print(f'\t\tDownloading {n_downloaded} masks completed in {time.time() - start_time} seconds')
+
                 # Break the loop when there is nothing to download.
                 if n_downloaded == 0:
                     continue
-                
-                # Init the mask indicies using the block number.
-                print(f'Creating sync mask for block: {blk} ...')
+
+                # Init the mask indices using the block number.
+                print(f'\n\tCreating mask for mask_wid: {mask_wid} ...')
                 mask_indices = {}
-                torch.manual_seed( blk )
+                torch.manual_seed(mask_wid)
                 start_time = time.time()
                 for name, param in model.named_parameters():
                     param = param.to(config.device)
                     next_mask = (torch.rand(param.shape, device=config.device) < (1 / hparams.compression)).float()
                     indices = next_mask.flatten().nonzero(as_tuple=False).flatten()
                     mask_indices[name] = indices
-                print(f'Creating sync block mask completed in {time.time() - start_time} seconds')
-            
+                print(f'\t\tCreating mask completed in {time.time() - start_time} seconds')
+
                 # Load all masks as state dicts.
-                print (f'Loading state dicts for block: {blk} ...')
+                print(f'\n\tLoading state dicts for mask_wid: {mask_wid} ...')
                 start_time = time.time()
                 mask_count = 0
                 masks_dicts_values = {}
-                for file in temp_files:
-                    mask = torch.load( file, map_location='cpu', weights_only = True )
+                for info in temp_files:
+                    masks_per_id_per_uid[info.mask_wid][info.uid] = {}
+                    mask = torch.load(info.temp_file, map_location='cpu')
+                    compression_per_uid[info.uid] = mask['compression']
                     mask_count += 1
                     for name in mask.keys():
+                        if name == 'compression':
+                            continue
                         mask_values = mask[name]['values']
                         if torch.isnan(mask_values).any():
                             continue
                         param_shape = model.get_parameter(name).shape
-                        indices = mask_indices[name] 
-                        decompressed = torch.zeros(param_shape, device='cpu').flatten() 
+                        indices = mask_indices[name]
+                        decompressed = torch.zeros(param_shape, device='cpu').flatten()
                         decompressed[indices] = mask_values
-                        if name not in masks_dicts_values:
-                            masks_dicts_values[name] = decompressed.view(param_shape)
-                        else:
-                            masks_dicts_values[name] += decompressed.view(param_shape)
-                print(f'Loading state dicts completed in {time.time() - start_time} seconds')
-                
+                        masks_per_id_per_uid[info.mask_wid][info.uid][name] = decompressed.view(param_shape)
+                       
+                mask_count_per_id[mask_wid] = mask_count
+                print(f'\t\tLoading state dicts completed in {time.time() - start_time} seconds')
+
                 # Average the masks before applying.
-                print (f'Averaging {mask_count} masks for block: {blk} ...')
+                print(f'Averaging {mask_count} masks for mask_wid: {mask_wid} ...')
                 start_time = time.time()
-                for key in masks_dicts_values.keys():
-                    masks_dicts_values[key] /= mask_count
-                print(f'Averaged state dicts in {time.time() - start_time} seconds')
                 
+                # Get the shape of the first parameter mask to initialize tensors
+                first_mask = next(iter(next(iter(masks_per_id_per_uid[mask_wid].values())).values()))
+                device = first_mask.device
+
+                param_names = list(next(iter(masks_per_id_per_uid[mask_wid].values())).keys())
+                param_sums = {name: torch.zeros_like(first_mask, device=device) for name in param_names}
+                param_counts = {name: torch.zeros_like(first_mask, device=device) for name in param_names}
+
+                # Aggregate masks
+                for uid, mask in masks_per_id_per_uid[mask_wid].items():
+                    for param_name, param_mask in mask.items():
+                        param_sums[param_name].add_(param_mask)
+                        param_counts[param_name].add_((param_mask != 0).float())
+
+                # Compute average masks
+                masks_dicts_values = {}
+                for param_name in param_names:
+                    masks_dicts_values[param_name] = torch.where(
+                        param_counts[param_name] > 0,
+                        param_sums[param_name] / (param_counts[param_name] + 1e-10),
+                        torch.zeros_like(param_sums[param_name])
+                    )
+                print(f'Averaged state dicts in {time.time() - start_time} seconds')
+
+
                 # Set the average into the model.
-                print(f'Applying {mask_count} masks for block: {blk} ...')
+                print(f'Applying {mask_count} masks for mask_wid: {mask_wid} ...')
                 start_time = time.time()  # Start timing
                 for name, param in model.named_parameters():
-                    indices = mask_indices[name]
                     if name in masks_dicts_values:
                         if masks_dicts_values[name].shape == param.shape:
-                            # Apply the mask values to the flattened param data.
-                            on_device = masks_dicts_values[name].to(model.device).flatten()
-                            param_flat = param.data.flatten()
-                            param_flat[indices] = on_device[indices]
-                            param.data.copy_(param_flat.view(param.shape))
-                            del on_device, param_flat
+                            param.data.add_(masks_dicts_values[name].to(model.device))
                         else:
                             print(f"Shape mismatch for {name}: expected {param.shape}, got {masks_dicts_values[name].shape}")
                 for key in masks_dicts_values.keys():
-                    masks_dicts_values[key].cpu()
+                    masks_dicts_values[key] = masks_dicts_values[key].cpu()
                 for key in mask_indices.keys():
                     mask_indices[key] = mask_indices[key].cpu()
                 del mask_indices, masks_dicts_values
                 print(f'Applying {mask_count} masks completed in {time.time() - start_time} seconds')
                 
                 # Delete files and clean up.
-                print (f'Deleting files for block: {blk} ...')
+                print(f'\n\tDeleting files for mask_wid: {mask_wid} ...')
                 start_time = time.time()
-                for file in temp_files:
-                    os.remove(file)
-                print(f'Deleting files completed in {time.time() - start_time} seconds')
-                
+                for info in temp_files:
+                    os.remove(info.temp_file)
+                print(f'\t\tDeleting files completed in {time.time() - start_time} seconds')
+
+            # Log the average number of masks applied per mask_wid
+            avg_masks_per_mask_wid = sum(mask_count_per_id.values()) / len(mask_count_per_id) if mask_count_per_id else 0
+            if config.use_wandb: wandb.log({"avg_masks_per_mask_wid": avg_masks_per_mask_wid})
+
             # Print completion
+            del mask_filenames_per_mask_wid
             torch.cuda.empty_cache()
-            print(f'Downloading masks for blocks: {all_sync_blocks} in {time.time() - full_sync_start_time} seconds')
-                              
+            print(f'\tDownloading masks for blocks: {all_sync_blocks} and mask_wids: {mask_filenames_per_mask_wid.keys()} in {time.time() - full_sync_start_time} seconds')
             # Get the pages for this block and my_uid.
             # This is global and deterministic
-            n_pages = max(1, int(config.desired_batch_size * 0.01))
-            print (f'Loading {n_pages} pages ...')
+            n_pages = max(1, int(hparams.desired_batch_size * 0.01))
+            print (f'\nLoading {n_pages} pages ...')
             start_time = time.time()  # Start timing
             pages = SubsetFineWebEdu2Loader.next_pages(
-                offset = subtensor.block + n_pages,
+                offset = subtensor.block + hparams.pages_window_speed,
                 n_pages = n_pages,
                 seed = my_uid 
             )
@@ -274,20 +363,23 @@ def main(config):
                 pages_info = pages,
                 tokenizer = hparams.tokenizer
             )
-            print(f'Loading {n_pages} pages completed in {time.time() - start_time} seconds')
+            # TODO: see if wrapping dataloader is faster, with multiple workers and pin_memory=True
+            # dataset = torch.utils.data.DataLoader( dataset, batch_size=1, shuffle=True, num_workers=8, pin_memory=True )
+            print(f'\n\tLoading {n_pages} pages completed in {time.time() - start_time} seconds')
             
             # Train my model on the current page.
+            print (f'\nTraining {n_pages} pages ...')
             torch.cuda.empty_cache() # Empty cache going into the training step.
+            optimizer.zero_grad() # Clear any lingering grads.
             start_time = time.time()  # Start timing
-            optimizer.zero_grad()
             total_loss = 0.0
-            total_steps = config.desired_batch_size // config.actual_batch_size
+            total_steps = hparams.desired_batch_size // config.actual_batch_size
             progress_bar = tqdm(total=total_steps, desc="Training:")
             for idx, batch in enumerate(dataset):
                 input_ids = torch.tensor(batch, dtype=torch.long).to(model.device)
                 labels = input_ids.clone()
                 labels = torch.where(labels == hparams.tokenizer.pad_token_id, -100, labels)
-                with torch.amp.autocast( device_type = model.device.type, dtype = torch.float16 ):  # Enable autocasting for mixed precision
+                with torch.amp.autocast( device_type = model.device.type, dtype = torch.bfloat16 ):  # Enable autocasting for mixed precision
                     outputs = model(input_ids = input_ids, labels=labels)
                 total_loss += outputs.loss.item()
                 loss = outputs.loss / total_steps
@@ -299,9 +391,13 @@ def main(config):
             
             # Try step with error handling.
             try:
+                # grad norm clipping
+                if hparams.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), hparams.grad_clip)
                 scaler.step(optimizer)  # Unscale the gradients and step the optimizer
                 scaler.update()  # Update the scaler for next iteration
                 scheduler.step()  # Update the learning rate.
+                optimizer.zero_grad()
             except AssertionError as e:
                 print(f"An error occurred during the optimizer step: {e}")
             
@@ -309,38 +405,42 @@ def main(config):
             del input_ids, labels, outputs
             torch.cuda.empty_cache() # Empty cache at end of step.
             
-            # Calculate and print average loss
+            # Calculate, print and logg average loss
             average_loss = total_loss / total_steps
-            print('loss:', average_loss, 'learning_rate:', scheduler.get_last_lr()[0])
+            total_time = time.time() - start_time
+            steps_per_second = total_steps / total_time
+            batches_per_second = config.actual_batch_size * total_steps / total_time
+            tokens_per_second = hparams.sequence_length * config.actual_batch_size * total_steps / total_time
             if config.use_wandb:
                 wandb.log({
                     "step_loss": average_loss,
                     "learning_rate": scheduler.get_last_lr()[0],
-                    f"incentive{my_uid}": float(metagraph.I[my_uid])
+                    f"incentive{my_uid}": float(metagraph.I[my_uid]),
+                    "steps_per_second": steps_per_second,
+                    "batches_per_second": batches_per_second,
+                    "tokens_per_second": tokens_per_second
                 })
-            total_time = time.time() - start_time
-            print(f'Training completed in {total_time} seconds')
-            print(f'Steps per second: {total_steps / total_time}')
-            print(f'Batches per second: {config.actual_batch_size * total_steps / total_time}')
-            print(f'Tokens per second: {hparams.sequence_length * config.actual_batch_size * total_steps / total_time}')
+            print('\tloss:', average_loss, 'learning_rate:', scheduler.get_last_lr()[0])
+            print(f'\tTraining completed in {total_time} seconds, Steps per second: {steps_per_second}, Batches per second: {batches_per_second}, Tokens per second: {tokens_per_second}')
             
             # Select the block to produce a mask for.
             next_upload_block = subtensor.block
             
             # Get the proper mask for my upload block + page.
-            print(f'Creating upload mask ...')
+            print(f'\nCreating upload mask ...')
             start_time = time.time()  # Start timing
             upload_mask = {}
-            torch.manual_seed(next_upload_block)  # Seed torch's random generator with the upload block.
+            torch.manual_seed( block_to_mask_window_id(next_upload_block) )  # Seed torch's random generator with the upload mask for its mask_wid.
             for name, param in model.named_parameters():
                 param = param.to(config.device)
                 next_mask = (torch.rand(param.shape, device=config.device) < (1 / config.compression)).float()
                 upload_mask[name] = next_mask.to('cpu')
-            print(f'Creating upload block mask completed in {time.time() - start_time} seconds')
+            print(f'\tCreating upload mask_wid mask completed in {time.time() - start_time} seconds')
             
             # Mask the model values given the mask and produce a state dict.                
-            print('Apply upload mask to model ...')
+            print('\nApply upload mask to model ...')
             model_state_dict = model.state_dict()
+            model_state_dict['compression'] = config.compression
             for name, param in model.named_parameters():
                 param_mask = upload_mask[name].to(param.device)
                 param_flat = param.flatten()
@@ -350,10 +450,10 @@ def main(config):
                 model_state_dict[name] = {'values': unmasked_params.to('cpu')}
                 del unmasked_indices
             del upload_mask
-            print(f'Applied mask to model completed in: {time.time() - start_time} seconds')
+            print(f'\tApplied mask to model completed in: {time.time() - start_time} seconds')
 
             # Upload the state dict of my masked weights.
-            print('Uploading mask ...')
+            print('\nUploading mask ...')
             start_time = time.time()
             upload_filename = f'mask-{wallet.hotkey.ss58_address}-{next_upload_block}.pt'
             with io.BytesIO() as module_buffer:
@@ -367,15 +467,23 @@ def main(config):
                 GrantReadACP='uri="http://acs.amazonaws.com/groups/global/AllUsers"'
             )
             upload_history.append(upload_filename)
-            print(f'Uploading mask to: {upload_filename} completed in {time.time() - start_time} seconds')
+            print(f'\tUploading mask to: {upload_filename} completed in {time.time() - start_time} seconds')
 
             # Delete old mask files and clean.
-            print('Deleting history ...')
+            print('\nDeleting history ...')
             start_time = time.time()
-            if len(upload_history) > 5:
+            if len(upload_history) > hparams.max_history:
                 to_delete = upload_history.pop(0)
                 CLIENT.delete_object(Bucket=config.bucket, Key=to_delete)
-            print(f'Deleting history completed in {time.time() - start_time} seconds')
+            print(f'\tDeleting history completed in {time.time() - start_time} seconds')
+            
+            # Calculate and log global steps per second
+            global_step_total_time = time.time() - global_step_start_time
+            global_steps_per_second = 1 / global_step_total_time
+            if config.use_wandb:
+                wandb.log({
+                    "global_steps_per_second": global_steps_per_second
+                })
                  
         # Handle keyboard interrupts to allow graceful shutdown.
         except (KeyboardInterrupt, SystemExit):
@@ -395,12 +503,7 @@ if __name__ == "__main__":
     parser.add_argument('--name', type=str, default=None, help='Optional miner name')
     parser.add_argument('--netuid', type=int, default=212, help='Bittensor network UID.')
     parser.add_argument('--bucket', type=str, default='decis', help='S3 bucket name')
-    parser.add_argument('--desired_batch_size', type=int, default=512, help='Training batch size per step')
     parser.add_argument('--actual_batch_size', type=int, default=8, help='Training batch size per accumulation.')
-    parser.add_argument('--learning_rate', type=float, default=4e-4, help='Learning rate for the optimizer')
-    parser.add_argument('--optimizer_beta1', type=float, default=0.9, help='Beta1 for the optimizer')
-    parser.add_argument('--optimizer_beta2', type=float, default=0.95, help='Beta2 for the optimizer')
-    parser.add_argument('--optimizer_weight_decay', type=float, default=0.1, help='Weight decay for the optimizer')
     parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
     parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')    
     parser.add_argument('--compression', type=int, default=300)    
