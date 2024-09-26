@@ -22,42 +22,50 @@ import requests
 from types import SimpleNamespace
 from transformers import AutoTokenizer, LlamaConfig
 
-<<<<<<< HEAD
 def load_hparams() -> SimpleNamespace:
+    # hparams = {
+    #     # Steps between full state syncing
+    #     'epoch_length': 25000,
+    #     # Delta compression rate.
+    #     'compression': 300,
+    #     # Global sequence length
+    #     'sequence_length': 1024,
+    #     # AutoTokenizer name.
+    #     'tokenizer_name': 'gpt2',
+    #     # Model arch.
+    #     'num_hidden_layers': 12,         # Layers
+    #     'hidden_size': 768,             # Hidden Size
+    #     'intermediate_size': 3072,       # Intermediate Size
+    #     'num_attention_heads': 12,        # Attention Heads
+    #     'num_key_value_heads': 12,        # Key/Value Heads
+    #     'activation_function': "swiGLU", # Activation Function
+    #     'max_position_embeddings': 1024, # Positional Embeddings (RoPE)
+    # }
     hparams = {
-        # Steps between full state syncing
-        'epoch_length': 25000,
-        # Delta compression rate.
-        'compression': 300,
-        # Global sequence length
-        'sequence_length': 1024,
-        # AutoTokenizer name.
-        'tokenizer_name': 'gpt2',
-        # Model arch.
-        'num_hidden_layers': 12,         # Layers
-        'hidden_size': 768,             # Hidden Size
-        'intermediate_size': 3072,       # Intermediate Size
-        'num_attention_heads': 12,        # Attention Heads
-        'num_key_value_heads': 12,        # Key/Value Heads
-        'activation_function': "swiGLU", # Activation Function
-        'max_position_embeddings': 1024, # Positional Embeddings (RoPE)
+        "epoch_length": 250000,
+        "compression": 300,
+        "sequence_length": 1024,
+        "tokenizer_name": "togethercomputer/LLaMA-2-7B-32K",
+        "num_hidden_layers": 12,
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "num_attention_heads": 12,
+        "num_key_value_heads": 12,
+        "activation_function": "swiGLU",
+        "max_position_embeddings": 1024,
+        "mask_window_length": 5,
+        "desired_batch_size": 128,
+        "learning_rate": 0.001,
+        "optimizer_beta1": 0.9,
+        "optimizer_beta2": 0.95,
+        "optimizer_weight_decay": 0.1,
+        "grad_clip": 1.0,
+        "cosine_epoch_length": 1000,
+        "eta_min": 1e-05,
+        "max_history": 5,
+        "pages_window_speed": 10
     }
     # Convert the dictionary to a SimpleNamespace
-=======
-# Cache file path
-HPARAMS_FILE = "hparams.json"
-
-def create_namespace(hparams: dict) -> SimpleNamespace:
-    """
-    Create a SimpleNamespace from the hyperparameters and add model configuration.
-
-    Args:
-        hparams (dict): Hyperparameters dictionary.
-
-    Returns:
-        SimpleNamespace: Namespace containing hyperparameters and model configuration.
-    """
->>>>>>> origin/master
     hparams_ns = SimpleNamespace(**hparams)
 
     hparams_ns.tokenizer = AutoTokenizer.from_pretrained(
@@ -78,31 +86,31 @@ def create_namespace(hparams: dict) -> SimpleNamespace:
 
     return hparams_ns
 
-def load_hparams() -> SimpleNamespace:
-    """
-    Load hyperparameters from a GitHub file, with caching and fallback mechanisms.
+# def load_hparams() -> SimpleNamespace:
+#     """
+#     Load hyperparameters from a GitHub file, with caching and fallback mechanisms.
 
-    Returns:
-        SimpleNamespace: A namespace containing the hyperparameters and model configuration.
+#     Returns:
+#         SimpleNamespace: A namespace containing the hyperparameters and model configuration.
 
-    Example:
-        hparams = load_hparams()
-        print(hparams.hidden_size)
-        print(hparams.model_config)
-    """
-    github_url = f"https://raw.githubusercontent.com/unconst/cont/master/hparams.json?timestamp={int(time.time())}"
-    try:
-        # Attempt to fetch from the GitHub file first
-        response = requests.get(github_url, timeout=10, headers={'Cache-Control': 'no-cache'})
-        response.raise_for_status()
-        hparams = json.loads(response.text)
-        print("Successfully loaded parameters from GitHub.")
-    except (requests.RequestException, json.JSONDecodeError) as e:
-        print(f"Error loading parameters from GitHub: {e}")
-        print("Attempting to load from cache...")
-        with open(HPARAMS_FILE, "r") as f:
-            hparams = json.load(f)
-    # Cache the new parameters
-    with open(HPARAMS_FILE, "w") as f:
-        json.dump(hparams, f, indent=4)
-    return create_namespace(hparams)
+#     Example:
+#         hparams = load_hparams()
+#         print(hparams.hidden_size)
+#         print(hparams.model_config)
+#     """
+#     github_url = f"https://raw.githubusercontent.com/unconst/cont/master/hparams.json?timestamp={int(time.time())}"
+#     try:
+#         # Attempt to fetch from the GitHub file first
+#         response = requests.get(github_url, timeout=10, headers={'Cache-Control': 'no-cache'})
+#         response.raise_for_status()
+#         hparams = json.loads(response.text)
+#         print("Successfully loaded parameters from GitHub.")
+#     except (requests.RequestException, json.JSONDecodeError) as e:
+#         print(f"Error loading parameters from GitHub: {e}")
+#         print("Attempting to load from cache...")
+#         with open(HPARAMS_FILE, "r") as f:
+#             hparams = json.load(f)
+#     # Cache the new parameters
+#     with open(HPARAMS_FILE, "w") as f:
+#         json.dump(hparams, f, indent=4)
+#     return create_namespace(hparams)
