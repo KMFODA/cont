@@ -201,6 +201,8 @@ def main(config):
                     for page in page_iterator:
                         for obj in page.get('Contents', []):
                             hotkey, blk = obj['Key'].split('-')[1], obj['Key'].split('-')[2].split('.')[0]
+                            if hotkey == wallet.hotkey.ss58_address:
+                                continue
                             if int(blk) in all_sync_blocks:
                                 mask_wid = block_to_mask_window_id(int(blk))
                                 mask_info = SimpleNamespace(bucket=bucket, hotkey=hotkey, filename=obj['Key'], uid=metagraph.hotkeys.index(hotkey), block=int(blk), mask_wid=mask_wid)
@@ -264,6 +266,8 @@ def main(config):
                     compression = mask['compression']
                     compressions_used.add(compression)
                     compression_per_uid[info.uid] = compression
+                    print(f"Loaded mask from UID {info.uid} (Hotkey: {info.hotkey}) with compression rate: {compression}")
+
 
                 # Generate mask indices per compression
                 mask_indices_per_compression = {}
@@ -273,10 +277,14 @@ def main(config):
                     for name, param in model.named_parameters():
                         param_shape = param.shape
                         # Generate mask using the specific compression rate
-                        next_mask = (torch.rand(param_shape) < (1 / compression)).float()
+                        next_mask = (torch.rand(param_shape, device=config.device) < (1 / compression)).float()
                         indices = next_mask.flatten().nonzero(as_tuple=False).flatten()
                         mask_indices[name] = indices
                     mask_indices_per_compression[compression] = mask_indices
+                    
+                    sample_param_name = list(model.named_parameters())[0][0]  # Get the first parameter name
+                    num_indices = len(mask_indices[sample_param_name])
+                    print(f"Generated mask indices for compression rate {compression}: {num_indices} indices in parameter '{sample_param_name}'")
 
                 print(f'\t\tGenerated mask indices in {time.time() - start_time} seconds')
 
@@ -313,16 +321,18 @@ def main(config):
                 
                 param_sums = {}
                 param_counts = {}
-                for param_name, param in model.named_parameters():
-                    param_size = param.numel()
-                    param_sums[param_name] = torch.zeros(param_size, dtype=torch.float32)
-                    param_counts[param_name] = torch.zeros(param_size, dtype=torch.float32)
-
+                for name in model.state_dict().keys():
+                    param_sums[name] = None
+                    param_counts[name] = None
+                    
                 # Aggregate masks
                 for uid in masks_per_uid:
                     mask = masks_per_uid[uid]
                     compression = compression_per_uid[uid]
                     mask_indices = mask_indices_per_compression[compression]
+                    hotkey = metagraph.hotkeys[uid]
+                    print(f"Aggregating mask from UID {uid} (Hotkey: {hotkey}) with compression rate: {compression}")
+    
                     for param_name in mask.keys():
                         if param_name == 'compression':
                             continue  # Skip non-parameter keys
@@ -333,19 +343,34 @@ def main(config):
                         if len(indices) != len(mask_values):
                             print(f"Length mismatch for parameter {param_name}: indices length {len(indices)}, mask values length {len(mask_values)}")
                             continue
-                        # Accumulate sums
-                        param_sums[param_name].index_add_(0, indices, mask_values)
-                        # Accumulate counts
-                        param_counts[param_name].index_add_(0, indices, torch.ones_like(mask_values))
+                        if param_sums[param_name] is None:
+                            param_size = model.state_dict()[param_name].numel()
+                            param_sums[param_name] = torch.zeros(param_size, dtype=torch.float32, device=config.device)
+                            param_counts[param_name] = torch.zeros(param_size, dtype=torch.float32, device=config.device)
+                        
+                        param_sums[param_name].index_add_(0, indices.to(config.device), mask_values.to(config.device))
+                        param_counts[param_name].index_add_(0, indices.to(config.device), torch.ones_like(mask_values, device=config.device))
 
+                # Include own params
+                for param_name in param_sums.keys():
+                    if param_sums[param_name] is not None:
+                        counts = param_counts[param_name]
+                        mask = counts > 0 
+                        if mask.any():
+                            param_values = model.state_dict()[param_name].data.flatten()
+                            param_sums[param_name][mask] += param_values[mask]
+                            param_counts[param_name][mask] += 1
+                
                 # Compute average masks
                 average_masks = {}
                 for param_name in param_sums.keys():
-                    counts = param_counts[param_name]
-                    counts[counts == 0] = 1  # Prevent division by zero
-                    avg_values = param_sums[param_name] / counts
-                    avg_values = avg_values.view(model.state_dict()[param_name].shape)
-                    average_masks[param_name] = avg_values
+                    if param_sums[param_name] is not None:
+                        counts = param_counts[param_name]
+                        mask = counts > 0
+                        avg_values = torch.zeros_like(counts)
+                        avg_values[mask] = param_sums[param_name][mask] / counts[mask]
+                        avg_values = avg_values.view(model.state_dict()[param_name].shape)
+                        average_masks[param_name] = avg_values
 
                 print(f'Averaged masks in {time.time() - start_time} seconds')
 
@@ -354,7 +379,9 @@ def main(config):
                 start_time = time.time()  # Start timing
                 for name, param in model.named_parameters():
                     if name in average_masks:
-                        param.data.add_(average_masks[name].to(param.device))
+                        avg_values = average_masks[name].to(param.device)
+                        counts_mask = (param_counts[name].view(param.shape).to(param.device) > 0)
+                        param.data[counts_mask] = avg_values[counts_mask]
                     else:
                         print(f"Name not in average_masks")
                 for key in masks_dicts_values.keys():
@@ -369,6 +396,9 @@ def main(config):
                 start_time = time.time()
                 for info in temp_files:
                     os.remove(info.temp_file)
+                for key in param_sums.keys():
+                    param_sums[key] = None
+                    param_counts[key] = None
                 print(f'\t\tDeleting files completed in {time.time() - start_time} seconds')
 
             # Log the average number of masks applied per mask_wid
@@ -463,10 +493,10 @@ def main(config):
             start_time = time.time()  # Start timing
             upload_mask = {}
             torch.manual_seed( block_to_mask_window_id(next_upload_block) )  # Seed torch's random generator with the upload mask for its mask_wid.
+            torch.cuda.manual_seed_all( block_to_mask_window_id(next_upload_block) )
             for name, param in model.named_parameters():
-                param = param.to(config.device)
                 next_mask = (torch.rand(param.shape, device=config.device) < (1 / config.compression)).float()
-                upload_mask[name] = next_mask.to('cpu')
+                upload_mask[name] = next_mask
             print(f'\tCreating upload mask_wid mask completed in {time.time() - start_time} seconds')
             
             # Mask the model values given the mask and produce a state dict.                
