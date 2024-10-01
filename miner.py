@@ -284,15 +284,16 @@ def main(config):
                 print(f'\t\tLoading values and indices completed in {time.time() - start_time} seconds')
                 
                 # Include own params
-                for name in masked_updates:
-                    indices = masked_updates[name]['indices'].to(config.device)
-                    values = masked_updates[name]['values'].to(config.device)
-                    if name not in aggregated_updates:
-                        aggregated_updates[name] = {}
-                        aggregated_updates[name]['indices'] = []
-                        aggregated_updates[name]['values'] = []
-                    aggregated_updates[name]['indices'].append(indices)
-                    aggregated_updates[name]['values'].append(values)
+                if 'masked_updates' in locals() and masked_updates:
+                    for name in masked_updates:
+                        indices = masked_updates[name]['indices'].to(config.device)
+                        values = masked_updates[name]['values'].to(config.device)
+                        if name not in aggregated_updates:
+                            aggregated_updates[name] = {}
+                            aggregated_updates[name]['indices'] = []
+                            aggregated_updates[name]['values'] = []
+                        aggregated_updates[name]['indices'].append(indices)
+                        aggregated_updates[name]['values'].append(values)
                 
                 # Average the masks before applying.
                 print(f'Averaging {mask_count} masks for mask_wid: {mask_wid} ...')
