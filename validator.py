@@ -200,127 +200,64 @@ def main(config):
                 # Break the loop when there is nothing to download.
                 if n_downloaded == 0:
                     continue
-
-                # Initialize masks_per_uid to store loaded masks
-                masks_per_uid = {}
-
-                # Collect unique compression rates and per-miner compression, and load masks
-                compressions_used = set()
-                compression_per_uid = {}
-                for info in temp_files:
-                    # Load the mask only once
-                    mask = torch.load(info.temp_file, map_location='cpu')
-                    masks_per_uid[info.uid] = mask  # Store the loaded mask
-                    compression = mask['compression']
-                    compressions_used.add(compression)
-                    compression_per_uid[info.uid] = compression
-                    print(f"Loaded mask from UID {info.uid} (Hotkey: {info.hotkey}) with compression rate: {compression}")
-
-
-                # Generate mask indices per compression
-                mask_indices_per_compression = {}
-                for compression in compressions_used:
-                    torch.manual_seed(mask_wid)
-                    torch.cuda.manual_seed_all(mask_wid)
-                    mask_indices = {}
-                    for name, param in model.named_parameters():
-                        param_shape = param.shape
-                        # Generate mask using the specific compression rate
-                        next_mask = (torch.rand(param_shape, device=config.device) < (1 / compression)).float()
-                        indices = next_mask.flatten().nonzero(as_tuple=False).flatten()
-                        mask_indices[name] = indices
-                    mask_indices_per_compression[compression] = mask_indices
-
-                    sample_param_name = list(model.named_parameters())[0][0]  # Get the first parameter name
-                    num_indices = len(mask_indices[sample_param_name])
-                    print(f"Generated mask indices for compression rate {compression}: {num_indices} indices in parameter '{sample_param_name}'")
-                    
-                print(f'\t\tGenerated mask indices in {time.time() - start_time} seconds')
-
+                
+                aggregated_updates = {}
+                
                 # Load all masks as state dicts.
                 print(f'\n\tLoading state dicts for mask_wid: {mask_wid} ...')
                 start_time = time.time()
                 mask_count = 0
-                masks_dicts_values = {}
                 for info in temp_files:
-                    masks_per_id_per_uid[info.mask_wid][info.uid] = {}
-                    mask = masks_per_uid[info.uid]  # Retrieve the already loaded mask
-                    compression = compression_per_uid[info.uid]
+                    # Load the mask directly
+                    mask = torch.load(info.temp_file, map_location='cpu')
                     mask_count += 1
-                    torch.manual_seed(info.mask_wid)
-                    torch.cuda.manual_seed_all(mask_wid)
-                    mask_indices = mask_indices_per_compression[compression]
+                    # Iterate over each parameter in the mask
                     for name in mask.keys():
                         if name == 'compression':
-                            continue
-                        mask_values = mask[name]['values']
-                        if torch.isnan(mask_values).any():
-                            continue
-                        indices = mask_indices[name]
-                        if len(indices) != len(mask_values):
-                            print(f"Length mismatch for parameter {name}: indices length {len(indices)}, mask values length {len(mask_values)}")
-                            continue
-                        # Instead of decompressing, store indices and values for efficient aggregation
-                        masks_per_id_per_uid[info.mask_wid][info.uid][name] = (indices, mask_values)
-                mask_count_per_id[mask_wid] = mask_count
-                print(f'\t\tLoading state dicts completed in {time.time() - start_time} seconds')
+                            continue  # Skip if compression is included
+                        indices = mask[name]['indices']
+                        values = mask[name]['values']
+                        # Ensure indices and values are tensors
+                        indices = indices.to(config.device)
+                        values = values.to(config.device)
+                        # Initialize the aggregated_updates entry if not present
+                        if name not in aggregated_updates:
+                            aggregated_updates[name] = {}
+                            aggregated_updates[name]['indices'] = []
+                            aggregated_updates[name]['values'] = []
+                        # Append the indices and values to the lists
+                        aggregated_updates[name]['indices'].append(indices)
+                        aggregated_updates[name]['values'].append(values)
+                print(f'\t\tLoading values and indices completed in {time.time() - start_time} seconds')
                 
                 print(f'Averaging {mask_count} masks for mask_wid: {mask_wid} ...')
                 start_time = time.time()
                 
                 param_sums = {}
                 param_counts = {}
-                for param_name in model.state_dict().keys():
-                    param_sums[param_name] = None
-                    param_counts[param_name] = None
-                    
-                # Aggregate masks
-                for uid in masks_per_uid:
-                    mask = masks_per_uid[uid]
-                    compression = compression_per_uid[uid]
-                    mask_indices = mask_indices_per_compression[compression]
-                    hotkey = metagraph.hotkeys[uid]
-                    print(f"Aggregating mask from UID {uid} (Hotkey: {hotkey}) with compression rate: {compression}")
-    
-                    for param_name in mask.keys():
-                        if param_name == 'compression':
-                            continue  # Skip non-parameter keys
-                        mask_values = mask[param_name]['values']
-                        if torch.isnan(mask_values).any():
-                            continue
-                        indices = mask_indices[param_name]
-                        if len(indices) != len(mask_values):
-                            print(f"Length mismatch for parameter {param_name}: indices length {len(indices)}, mask values length {len(mask_values)}")
-                            continue
-                        
-                        if param_sums[param_name] is None:
-                            param_size = model.state_dict()[param_name].numel()
-                            param_sums[param_name] = torch.zeros(param_size, dtype=torch.float32, device=config.device)
-                            param_counts[param_name] = torch.zeros(param_size, dtype=torch.float32, device=config.device)
-                        
-                        param_sums[param_name].index_add_(0, indices.to(config.device), mask_values.to(config.device))
-                        param_counts[param_name].index_add_(0, indices.to(config.device), torch.ones_like(mask_values, device=config.device))
+                for name, param in model.named_parameters():
+                    param_size = param.numel()
+                    param_sums[name] = torch.zeros(param_size, dtype=torch.float32, device=config.device)
+                    param_counts[name] = torch.zeros(param_size, dtype=torch.float32, device=config.device)
+
+                for name in aggregated_updates:
+                    all_indices = torch.cat(aggregated_updates[name]['indices'])
+                    all_values = torch.cat(aggregated_updates[name]['values'])
+                    # Sum the updates (parameter deltas)
+                    param_sums[name].index_add_(0, all_indices, all_values)
+                    # Increment counts
+                    param_counts[name].index_add_(0, all_indices, torch.ones_like(all_values))
                 
-                # Include own params
-                for param_name in param_sums.keys():
-                    if param_sums[param_name] is not None:
-                        counts = param_counts[param_name]
-                        mask = counts > 0 
-                        if mask.any():
-                            param_values = model.state_dict()[param_name].data.flatten()
-                            param_sums[param_name][mask] += param_values[mask]
-                            param_counts[param_name][mask] += 1
-                
-                # Compute average masks
-                average_masks = {}
-                for param_name in param_sums.keys():
-                    if param_sums[param_name] is not None:
-                        counts = param_counts[param_name]
-                        mask = counts > 0
-                        avg_values = torch.zeros_like(counts)
-                        avg_values[mask] = param_sums[param_name][mask] / counts[mask]
-                        avg_values = avg_values.view(model.state_dict()[param_name].shape)
-                        average_masks[param_name] = avg_values
+                for name in param_sums:
+                    counts = param_counts[name]
+                    # Avoid division by zero
+                    counts[counts == 0] = 1.0
+                    # Compute average updates
+                    avg_updates = param_sums[name] / counts
+                    # Reshape to parameter shape
+                    avg_updates = avg_updates.view_as(model.state_dict()[name])
+                    # Store the average updates
+                    param_sums[name] = avg_updates
 
                 print(f'Averaged masks in {time.time() - start_time} seconds')
 
@@ -328,17 +265,13 @@ def main(config):
                 print(f'Applying {mask_count} masks for mask_wid: {mask_wid} ...')
                 start_time = time.time()  # Start timing
                 for name, param in model.named_parameters():
-                    if name in average_masks:
-                        avg_values = average_masks[name].to(param.device)
-                        counts_mask = (param_counts[name].view(param.shape).to(param.device) > 0)
-                        param.data[counts_mask] = avg_values[counts_mask]
+                    if name in param_sums:
+                        update = param_sums[name]
+                        # Apply the update
+                        param.data += update.to(param.device)
                     else:
                         print(f"Name not in average_masks")
-                for key in masks_dicts_values.keys():
-                    masks_dicts_values[key] = masks_dicts_values[key].cpu()
-                for key in mask_indices.keys():
-                    mask_indices[key] = mask_indices[key].cpu()
-                del mask_indices
+                
                 print(f'Applying {mask_count} masks completed in {time.time() - start_time} seconds')
                 
                 # Delete files and clean up.
@@ -346,9 +279,9 @@ def main(config):
                 start_time = time.time()
                 for info in temp_files:
                     os.remove( info.temp_file )
-                for key in param_sums.keys():
-                    param_sums[key] = None
-                    param_counts[key] = None
+                del param_sums
+                del param_counts
+                del aggregated_updates
                 print(f'Deleting files completed in {time.time() - start_time} seconds')
 
             # Print completion
