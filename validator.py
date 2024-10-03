@@ -50,10 +50,10 @@ class Validator:
     @staticmethod
     def config():
         parser = argparse.ArgumentParser(description='Validator script')
-        parser.add_argument('--project', type=str, default='QZWXEC', help='Optional wandb project name')
+        parser.add_argument('--project', type=str, default='cont', help='Optional wandb project name')
         parser.add_argument('--netuid', type=int, default=220, help='Bittensor network UID.')
         parser.add_argument('--bucket', type=str, default='decis', help='S3 bucket name')
-        parser.add_argument('--actual_batch_size', type=int, default=8, help='Training batch size per accumulation.')
+        parser.add_argument('--actual_batch_size', type=int, default=4, help='Training batch size per accumulation.')
         parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
@@ -83,6 +83,10 @@ class Validator:
         logger.info('\n' + '-' * 40 + ' Objects ' + '-' * 40)
         logger.info(f'\nWallet: {self.wallet}\nSubtensor: {self.subtensor}\nMetagraph: {self.metagraph}\nUID: {self.uid}')
 
+        # Create custom temp dir for multi-gpu instance
+        tempfile.tempdir = os.path.join('/tmp', f'validator_{self.uid}')
+        os.makedirs(tempfile.tempdir, exist_ok=True)
+        
         # Init bucket.
         try:
             if self.config.bucket != self.subtensor.get_commitment(self.config.netuid, self.uid):
@@ -177,12 +181,6 @@ class Validator:
                         await asyncio.sleep(0.1)
                     continue
                 
-                # Get the indices for the current window that the miners will be evaluated on.
-                indices = await get_indices_for_window(
-                    model = self.model, 
-                    seed = self.window_to_seed( self.eval_window + 1 ), # Seed index from current window
-                    compression = self.hparams.compression
-                )
                 
                 # Eval the downloaded slices.
                 random.shuffle(slice_files)
@@ -190,16 +188,26 @@ class Validator:
                 for idx, slice_info in enumerate(slice_files[self.eval_window]):
                     try:
                         # Break if we run out of time.
-                        if self.step_window != self.current_window: break
+                        if self.step_window != self.current_window:
+                            break
+
                         # Get info from slice
-                        uid = self.metagraph.hotkeys.index( slice_info.hotkey )
-                        # Get the slice values.
-                        values = torch.load( slice_info.temp_file, map_location=torch.device(self.model.device), weights_only = True )
-                        # Set the values directly into the model, remembering the previous values.
+                        uid = self.metagraph.hotkeys.index(slice_info.hotkey)
+
+                        slice_i = torch.load(
+                            slice_info.temp_file,
+                            map_location=torch.device(self.model.device)
+                        )
+
                         previous_values = {}
                         for name, param in self.model.named_parameters():
-                            previous_values[name] = param.data.view(-1)[indices[name].to(self.model.device)].clone()
-                            param.data.view(-1)[indices[name].to(self.model.device)] = values[name].to(self.model.device)
+                            if name in slice_i:
+                                indices = slice_i[name]['indices'].to(self.model.device)
+                                values = slice_i[name]['values'].to(self.model.device)
+                                # Store previous values
+                                previous_values[name] = param.data.view(-1)[indices].clone()
+                                # Apply updates
+                                param.data.view(-1)[indices] += values
                         # Get the pages offset for the miner.
                         offset = self.eval_window * self.hparams.window_length * self.hparams.window_speed
                         start_time = time.time()
@@ -237,7 +245,9 @@ class Validator:
                         logger.info(f"\t\tComputed gradients in {time.time() - start_time} seconds")
                         # Inject the previous values into the model again, resetting the state
                         for name, param in self.model.named_parameters():
-                            param.data.view(-1)[indices[name].to(self.model.device)] = previous_values[name]
+                            if name in previous_values:
+                                indices = slice_i[name]['indices'].to(self.model.device)
+                                param.data.view(-1)[indices] = previous_values[name]
                         # Make reward the negative loss. 
                         total_reward = -loss.item()
                         # Update weights for miner.
@@ -272,8 +282,6 @@ class Validator:
                 eval_slices = await apply_slices_to_model( 
                     model = self.model, 
                     window = self.eval_window , # Get files from previous window.
-                    seed = self.window_seeds[ self.step_window ], # Use seed as the hash of the current window.
-                    compression = self.hparams.compression
                 )
                 applied_per_step = len(eval_slices)
                 logger.info(f"\t\tApplied {applied_per_step} from previous window: { self.eval_window } with seed: { self.window_seeds[ self.step_window ] } in {time.time() - start_time} seconds")

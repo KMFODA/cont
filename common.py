@@ -62,96 +62,79 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 semaphore = asyncio.Semaphore(1000)
 
 
-async def apply_slices_to_model(model: torch.nn.Module, window: int, seed: str, compression: int) -> List[str]:
+async def apply_slices_to_model(model: torch.nn.Module, window: int) -> List[str]:
     """
-    Applies slices from a specific window to the given model.
+    Applies slices (top-k updates) from a specific window to the given model.
 
     Args:
         model (torch.nn.Module): The PyTorch model to which the slices will be applied.
         window (int): The window identifier.
-        seed (str): The seed used for generating indices.
-        compression (int): The compression factor.
 
     Returns:
         List[str]: A list of all the slice files that were applied.
     """
-    # First get the indices associated with the window given the model.
-    indices_dict = await get_indices_for_window(model, seed, compression)
-    
     # Load all the slices associated with this window.
     slice_files = await load_files_for_window(window=window)
 
-    # Dictionary to keep track of the number of slices applied per parameter.
-    slices_per_param = {name: 0 for name, _ in model.named_parameters()}
+    # Initialize sum and count dictionaries
+    param_sums = {}
+    param_counts = {}
 
-    # Iterate over each slice file and apply it to the model.
+    for name, param in model.named_parameters():
+        param_sums[name] = torch.zeros_like(param.data.view(-1), device=param.device)
+        param_counts[name] = torch.zeros_like(param.data.view(-1), device=param.device)
+
+    # Iterate over each slice file and aggregate the updates
     for file_i in slice_files:
-        # Create a file lock to ensure exclusive access to the slice file.
         lock: FileLock = FileLock(f"{file_i}.lock")
         try:
-            # Attempt to acquire the lock with a timeout of 1 second.
             lock.acquire(timeout=1)
             try:
-                # Load the slice state from the file into a dictionary.
-                slice_i: Dict[str, torch.Tensor] = torch.load(
+                # Load the slice state from the file
+                slice_i = torch.load(
                     file_i,
                     map_location=torch.device(model.device),
-                    weights_only = True,
                 )
             finally:
-                # Release the lock after loading.
                 lock.release()
 
-            for name, param in model.named_parameters():
-                if name not in indices_dict or name not in slice_i:
-                    continue
-                values = slice_i[name].to(model.device)
-                param_indices = indices_dict[name].to(model.device)
-                param.data.view(-1)[param_indices] += values
-                slices_per_param[name] += 1
-                del values
-            del slice_i
+            for name in slice_i:
+                indices = slice_i[name]['indices'].to(model.device)
+                values = slice_i[name]['values'].to(model.device)
+                param_sums[name].index_add_(0, indices, values)
+                param_counts[name].index_add_(0, indices, torch.ones_like(values))
+
         except Timeout:
-            # The lock could not be acquired within the timeout.
             logger.error(f"Timeout occurred while trying to acquire lock on {file_i}")
-            continue  
+            continue
         except Exception as e:
             logger.exception(f"Error applying slice from {file_i}: {e}")
 
-    # Average the parameters by the number of slices applied.
+    # Apply the averaged updates to the model
     for name, param in model.named_parameters():
-        if name not in slices_per_param or name not in indices_dict or slices_per_param[name] == 0:
-            continue
-        param_indices = indices_dict[name].to(model.device)
-        param.data.view(-1)[param_indices] /= (slices_per_param[name] + 1)
+        counts = param_counts[name]
+        counts[counts == 0] = 1.0  # Avoid division by zero
+        avg_updates = param_sums[name] / counts
+        param.data.view(-1).add_(avg_updates)
 
-    # Return the list of the files applied.
     return slice_files
 
-async def upload_slice_for_window(bucket: str, model: torch.nn.Module, window: int, seed: str, wallet: 'bt.wallet', compression: int):
+async def upload_slice_for_window(bucket: str, masked_updates: Dict[str, Dict[str, torch.Tensor]], window: int, wallet: 'bt.wallet'):
     """
     Uploads a compressed slice of a PyTorch model to an S3 bucket.
 
     Args:
         bucket (str): Name of the S3 bucket.
-        model (torch.nn.Module): The PyTorch model to be sliceed and uploaded.
+        masked_updates (Dict): Dictionary containing indices and values of top-k gradients.
         window (int): The window identifier.
         wallet (bt.wallet): The wallet object containing the hotkey.
-        compression (int): The compression factor.
     """
     filename = f'slice-{window}-{wallet.hotkey.ss58_address}.pt'
     logger.debug(f"Uploading slice to S3: {filename}")
 
-    model_state_dict = model.state_dict()
-    indices = await get_indices_for_window(model, seed, compression)
-
-    # Apply the slice to the model parameters
-    for name, param in model.named_parameters():
-        model_state_dict[name] = param.data.view(-1)[indices[name].to(model.device)].cpu()
-
     # Create a temporary file and write the sliceed model state dictionary to it
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        torch.save(model_state_dict, temp_file)
+        torch.save(masked_updates, temp_file)
         temp_file_name = temp_file.name  # Store the temporary file name
 
     # Upload the file to S3
@@ -223,29 +206,29 @@ async def upload_master(bucket: str, model: torch.nn.Module, wallet: 'bt.wallet'
             os.remove(temp_file_name)
             logger.debug(f"Temporary file {temp_file_name} removed")
 
-async def get_indices_for_window(model: torch.nn.Module, seed: str, compression: int) -> Dict[str, torch.LongTensor]:
-    """
-    Computes the indices for the given window and compression factor.
+# async def get_indices_for_window(model: torch.nn.Module, seed: str, compression: int) -> Dict[str, torch.LongTensor]:
+#     """
+#     Computes the indices for the given window and compression factor.
 
-    Args:
-        model (torch.nn.Module): The PyTorch model.
-        seed (str): The window seed identifier.
-        compression (int): The compression factor.
+#     Args:
+#         model (torch.nn.Module): The PyTorch model.
+#         seed (str): The window seed identifier.
+#         compression (int): The compression factor.
 
-    Returns:
-        Dict[str, torch.LongTensor]: A dictionary mapping parameter names to index tensors.
-    """
-    logger.debug(f"Computing indices for window seed {seed} with compression {compression}")
-    result = {}
-    # Seed the random number generator with the seed
-    seed = int(hashlib.md5(str(seed).encode('utf-8')).hexdigest(), 16) % (2**32)
-    rng = np.random.default_rng(seed)
-    for name, param in model.named_parameters():
-        # Randomly select indices based on the compression factor
-        num_indices = max(1, int(param.numel() // compression))
-        indices = rng.choice(param.numel(), size=num_indices, replace=False)
-        result[name] = torch.from_numpy(indices).long().cpu()
-    return result
+#     Returns:
+#         Dict[str, torch.LongTensor]: A dictionary mapping parameter names to index tensors.
+#     """
+#     logger.debug(f"Computing indices for window seed {seed} with compression {compression}")
+#     result = {}
+#     # Seed the random number generator with the seed
+#     seed = int(hashlib.md5(str(seed).encode('utf-8')).hexdigest(), 16) % (2**32)
+#     rng = np.random.default_rng(seed)
+#     for name, param in model.named_parameters():
+#         # Randomly select indices based on the compression factor
+#         num_indices = max(1, int(param.numel() // compression))
+#         indices = rng.choice(param.numel(), size=num_indices, replace=False)
+#         result[name] = torch.from_numpy(indices).long().cpu()
+#     return result
 
 async def download_file(s3_client, bucket: str, filename: str) -> str:
     """

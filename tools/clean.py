@@ -47,7 +47,7 @@ CLIENT: boto3.client = boto3.client(
 )
 
 def main(
-    bucket: str = 'decis',
+    bucket: str = 'conti-testi',
 ):
     # Create your S3 connection.
     client: boto3.client = boto3.client(

@@ -51,15 +51,16 @@ class Miner:
     @staticmethod
     def config():
         parser = argparse.ArgumentParser(description='Miner script')
-        parser.add_argument('--project', type=str, default='QZWXEC', help='Optional wandb project name')
+        parser.add_argument('--project', type=str, default='cont', help='Optional wandb project name')
         parser.add_argument('--netuid', type=int, default=220, help='Bittensor network UID.')
         parser.add_argument('--bucket', type=str, default='decis', help='S3 bucket name')
-        parser.add_argument('--actual_batch_size', type=int, default=8, help='Training batch size per accumulation.')
+        parser.add_argument('--actual_batch_size', type=int, default=4, help='Training batch size per accumulation.')
         parser.add_argument('--device', type=str, default='cuda', help='Device to use for training (e.g., cpu or cuda)')
         parser.add_argument('--use_wandb', action='store_true', help='Use Weights and Biases for logging')
         parser.add_argument('--remote', action='store_true', help='Connect to other buckets')
         parser.add_argument('--debug', action='store_true', help='Enable debug logging')
         parser.add_argument('--trace', action='store_true', help='Enable trace logging')
+
         bt.wallet.add_args(parser)
         bt.subtensor.add_args(parser)
         config = bt.config(parser)
@@ -74,6 +75,7 @@ class Miner:
         self.config = Miner.config()
         logger.info('\n' + '-' * 40 + ' Config ' + '-' * 40)
         logger.info(self.config)
+        
 
         # Init bittensor objects.
         self.wallet = bt.wallet(config=self.config)
@@ -85,6 +87,10 @@ class Miner:
         logger.info('\n' + '-' * 40 + ' Objects ' + '-' * 40)
         logger.info(f'\nWallet: {self.wallet}\nSubtensor: {self.subtensor}\nMetagraph: {self.metagraph}\nUID: {self.uid}')
 
+        # Create custom temp dir for multi-gpu instance
+        tempfile.tempdir = os.path.join('/tmp', f'miner_{self.uid}')
+        os.makedirs(tempfile.tempdir, exist_ok=True)
+        
         # Init bucket.
         try:
             if self.config.bucket != self.subtensor.get_commitment(self.config.netuid, self.uid):
@@ -185,8 +191,6 @@ class Miner:
                 slice_files = await apply_slices_to_model( 
                     model = self.model, 
                     window = self.step_window - 1, # Get files from previous window.
-                    seed = self.window_seeds[ self.step_window ], # Use seed as the hash of the current window.
-                    compression = self.hparams.compression
                 )
                 applied_per_step = len(slice_files)
                 logger.info(f"\t\tApplied {applied_per_step} from previous window: {self.step_window - 1} with seed: { self.window_seeds[ self.step_window ] } in {time.time() - start_time} seconds")
@@ -236,6 +240,30 @@ class Miner:
                         window_exhuasted = True
                         break
                     
+                # Collect gradients and create masked updates
+                gradients = {}
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        gradients[name] = param.grad.detach().clone()
+                    else:
+                        gradients[name] = torch.zeros_like(param.data)
+                        
+                masked_updates = {}
+                learning_rate = self.hparams.learning_rate
+
+                for name, grad in gradients.items():
+                    grad_flat = grad.view(-1)
+                    grad_abs = grad_flat.abs()
+
+                    K = max(1, int(grad_flat.numel() // self.hparams.compression))
+                    topk_values, topk_indices = torch.topk(grad_abs, K)
+                    update_values = -learning_rate * grad_flat[topk_indices]
+                    masked_updates[name] = {
+                        'indices': topk_indices.cpu(),
+                        'values': update_values.cpu(),
+                    }
+                del gradients  # Free up memory
+                    
                 # Update training pages based on window exhuastion.
                 if window_exhuasted:
                     # Did exhuast window during training, decrease number of pages.
@@ -273,11 +301,9 @@ class Miner:
                 start_time = time.time()
                 await upload_slice_for_window(
                     bucket = self.config.bucket, 
-                    model = self.model, 
+                    masked_updates=masked_updates,
                     window = self.step_window, # Upload for the previous window 
-                    seed = self.window_seeds[ self.step_window + 1 ], # Seed the index by the hash of the new window.
                     wallet = self.wallet, 
-                    compression = self.hparams.compression
                 )
                 logger.info(f"\t\tFinished upload for window: {self.step_window} with seed: {self.window_seeds[ self.step_window + 1 ]} in {time.time() - start_time} seconds.")
                 
